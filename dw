@@ -1,0 +1,662 @@
+-- Light Joiner (Gotham) — SDK key-gated (API key hidden in code)
+-- Flow:
+--   1) Try auto-start with saved key (if valid) -> skip gate.
+--   2) Otherwise show "Light Joiner Key" gate (textbox + Verify).
+--   3) On valid key via Junkie SDK -> destroy gate -> load main UI.
+--   4) While running, periodically re-verify; if invalid -> stop & show gate next run.
+--
+-- Notes:
+--   - API key is embedded below. In public releases, consider a server-side proxy.
+--   - Provider defaults to "Mixed". Change SERVICE/PROVIDER constants as needed.
+
+local CoreGui          = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local Players          = game:GetService("Players")
+local VIM              = game:GetService("VirtualInputManager")
+local TeleportService  = game:GetService("TeleportService")
+local TweenService     = game:GetService("TweenService")
+local HttpService      = game:GetService("HttpService")
+
+-- ===== Junkie SDK =====
+local JunkieKeySystem
+local ok, err = pcall(function()
+    JunkieKeySystem = loadstring(game:HttpGet("https://junkie-development.de/sdk/JunkieKeySystem.lua"))()
+end)
+if not ok or not JunkieKeySystem then
+    warn("[LightJoiner] Failed to load Junkie SDK")
+end
+
+-- ===== Config (Hidden — do NOT render in UI) =====
+local API_KEY      = "cc1633fb-e42f-4ac4-af15-1d4f41b7f4e4"  -- your panel API key
+local SERVICE      = "Light Joiner"         -- appears in your Junkie dashboard
+local PROVIDER     = "LightJoiner"          -- set per your setup: "Mixed" / etc.
+local RECHECK_SEC  = 180                    -- periodic re-verify while running
+
+-- ===== Persistent Key Storage (executor FS) =====
+local FS = {
+    has = (typeof(isfile)=="function" and typeof(readfile)=="function"
+        and typeof(writefile)=="function" and typeof(makefolder)=="function"
+        and typeof(isfolder)=="function"),
+    del = (typeof(delfile)=="function" and delfile) or (typeof(deletefile)=="function" and deletefile) or nil
+}
+local LJ_DIR  = "LightJoiner"
+local LJ_FILE = LJ_DIR .. "/key.json"
+
+local function saveKey(k)
+    if not FS.has then return end
+    pcall(function()
+        if not isfolder(LJ_DIR) then makefolder(LJ_DIR) end
+        writefile(LJ_FILE, HttpService:JSONEncode({ key = k, ts = os.time() }))
+    end)
+end
+
+local function loadKey()
+    if not FS.has or not isfile(LJ_FILE) then return nil end
+    local okj, data = pcall(function() return HttpService:JSONDecode(readfile(LJ_FILE)) end)
+    if okj and type(data)=="table" and type(data.key)=="string" and data.key~="" then
+        return data.key
+    end
+    return nil
+end
+
+local function clearSavedKey()
+    if not FS.has then return end
+    if FS.del and isfile(LJ_FILE) then
+        pcall(function() FS.del(LJ_FILE) end)
+    else
+        pcall(function() writefile(LJ_FILE, HttpService:JSONEncode({ key = "", ts = os.time() })) end)
+    end
+end
+
+-- ========= Main UI (created after verify) =========
+local function createMainUI()
+    -- This function builds your full Light Joiner UI (Main/MPS, etc.).
+    -- (We keep it here so API key never needs to be shown in the UI.)
+    local DISCORD_TEXT = "discord.gg/VVku8zFKZ"
+    local queue = {
+        data = table.create(100),
+        head = 1,
+        tail = 1,
+        size = 0
+    }
+    local pumping = false
+    local minMPS = 15000000
+    local running = false
+    local teleportBusy = false
+    local TELEPORT_TIMEOUT_FRAMES = 180
+    
+    local function pushMessage(item)
+        if queue.size >= 100 then return end
+        queue.data[queue.tail] = item
+        queue.tail = (queue.tail % 100) + 1
+        queue.size = queue.size + 1
+    end
+
+    local function popMessage()
+        if queue.size == 0 then return nil end
+        local item = queue.data[queue.head]
+        queue.data[queue.head] = nil
+        queue.head = (queue.head % 100) + 1
+        queue.size = queue.size - 1
+        return item
+    end
+
+    local function clearQueue()
+        table.clear(queue.data)
+        queue.head = 1
+        queue.tail = 1
+        queue.size = 0
+    end
+
+    local function yieldOneFrame() RunService.Heartbeat:Wait() end
+    local function yieldFrames(n) for i=1,(n or 1) do RunService.Heartbeat:Wait() end end
+    local function microPause(frames) if frames and frames>0 then return yieldFrames(frames) end; yieldOneFrame() end
+    
+    local function parseNumberLike(s)
+        if type(s) ~= "string" then return nil end
+        local str = s:lower():gsub("%s+", "")
+        if str:match("^%$?[%d,%.]+m/?s?$") then
+            local n = str:gsub("[^%d%.]", ""); local v = tonumber(n); if v then return v * 1e6 end
+        elseif str:match("^%$?[%d,%.]+k/?s?$") then
+            local n = str:gsub("[^%d%.]", ""); local v = tonumber(n); if v then return v * 1e3 end
+        else
+            local n = str:gsub("[^%d%.]", ""); if n == "" then return nil end
+            local v = tonumber(n); if v then return v end
+        end
+        return nil
+    end
+    
+    local function formatInt(n)
+        local s = tostring(math.floor(n + 0.5))
+        local left, num, right = string.match(s, '^([^%d]*%d)(%d*)(.-)$')
+        return left .. (num:reverse():gsub('(%d%d%d)', '%1,'):reverse()) .. right
+    end
+    
+    local function formatCompact(n)
+        local v = tonumber(n)
+        if not v then return tostring(n) end
+        if v >= 1e6 then
+            local s = string.format("%.1fm", v/1e6); return (s:gsub("%.0m","m"))
+        elseif v >= 1e3 then
+            local s = string.format("%.1fk", v/1e3); return (s:gsub("%.0k","k"))
+        else
+            return tostring(math.floor(v))
+        end
+    end
+
+    -- Pairing
+    local pending = { id = nil, mps = nil, timer = nil }
+    local lastMPS, lastMpsTime = nil, 0
+    local function nowClock() return os.clock() end
+    local STALE_MPS_SEC = 0.6
+    
+    local function classifyMessage(msg)
+        if type(msg) ~= "string" then return {kind="unknown"} end
+        if string.sub(msg, 1, 4) == "JOB:" then
+            return {kind="pair_job", id = string.sub(msg, 5)}
+        elseif string.sub(msg, 1, 4) == "MPS:" then
+            local raw = string.sub(msg, 5)
+            local n = tonumber(raw) or parseNumberLike(raw)
+            return {kind="pair_mps", value = n}
+        end
+        local okj, obj = pcall(function() return HttpService:JSONDecode(msg) end)
+        if okj and type(obj) == "table" then
+            if obj.script then
+                return {kind="script", src = tostring(obj.script)}
+            end
+            local id = obj.jobId or obj.jobid or obj.id
+            local mps = obj.mps or obj.money or obj.rate
+            if id then
+                return {kind="job", id = tostring(id), mps = tonumber(mps)}
+            end
+        end
+        if string.find(msg, "TeleportService") then
+            return {kind="script", src = msg}
+        end
+        return {kind="job", id = tostring(msg)}
+    end
+
+    -- Always-on banner
+    local BannerGui = Instance.new("ScreenGui")
+    BannerGui.Name = "LightJoinerBanner"
+    BannerGui.IgnoreGuiInset = true
+    BannerGui.Parent = CoreGui
+    
+    local DiscordTextLbl = Instance.new("TextLabel")
+    DiscordTextLbl.Size = UDim2.fromOffset(1000, 28)
+    DiscordTextLbl.AnchorPoint = Vector2.new(0.5, 0)
+    DiscordTextLbl.Position = UDim2.new(0.5, 0, 0, 6)
+    DiscordTextLbl.BackgroundTransparency = 1
+    DiscordTextLbl.Text = DISCORD_TEXT
+    DiscordTextLbl.TextColor3 = Color3.fromRGB(120, 205, 255)
+    DiscordTextLbl.TextStrokeColor3 = Color3.fromRGB(15, 20, 30)
+    DiscordTextLbl.TextStrokeTransparency = 0.2
+    DiscordTextLbl.Font = Enum.Font.GothamBold
+    DiscordTextLbl.TextSize = 18
+    DiscordTextLbl.TextXAlignment = Enum.TextXAlignment.Center
+    DiscordTextLbl.Parent = BannerGui
+
+    -- Main UI
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "LightJoiner_" .. tostring(math.random(1000,9999))
+    ScreenGui.Parent = CoreGui
+
+    local Card = Instance.new("Frame")
+    Card.Size = UDim2.fromOffset(560, 300)
+    Card.Position = UDim2.new(0.5, -280, 0.5, -150)
+    Card.BackgroundColor3 = Color3.fromRGB(19, 22, 29)
+    Card.BorderSizePixel = 0
+    Card.Active = true
+    Card.Draggable = true
+    Card.Parent = ScreenGui
+    Instance.new("UICorner", Card).CornerRadius = UDim.new(0, 16)
+
+    local TopBar = Instance.new("Frame")
+    TopBar.Size = UDim2.new(1, -14, 0, 56)
+    TopBar.Position = UDim2.new(0, 7, 0, 7)
+    TopBar.BorderSizePixel = 0
+    TopBar.BackgroundColor3 = Color3.fromRGB(28, 36, 52)
+    TopBar.Parent = Card
+    Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 12)
+    
+    local TopGrad = Instance.new("UIGradient", TopBar)
+    TopGrad.Rotation = 10
+    TopGrad.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0.00, Color3.fromRGB(40, 120, 200)),
+        ColorSequenceKeypoint.new(1.00, Color3.fromRGB(32, 160, 128))
+    }
+
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(0.60, 0, 1, 0)
+    Title.Position = UDim2.new(0, 14, 0, 0)
+    Title.BackgroundTransparency = 1
+    Title.Text = "Light Joiner"
+    Title.TextColor3 = Color3.fromRGB(235, 240, 255)
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 22
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    Title.Parent = TopBar
+
+    local UsernameLabel = Instance.new("TextLabel")
+    UsernameLabel.Size = UDim2.new(0.40, -14, 1, 0)
+    UsernameLabel.Position = UDim2.new(0.60, 0, 0, 0)
+    UsernameLabel.BackgroundTransparency = 1
+    UsernameLabel.Text = "User: ..."
+    UsernameLabel.TextColor3 = Color3.fromRGB(195, 205, 225)
+    UsernameLabel.Font = Enum.Font.GothamSemibold
+    UsernameLabel.TextSize = 14
+    UsernameLabel.TextXAlignment = Enum.TextXAlignment.Right
+    UsernameLabel.Parent = TopBar
+
+    local Sidebar = Instance.new("Frame")
+    Sidebar.Size = UDim2.new(0, 122, 1, -76)
+    Sidebar.Position = UDim2.new(0, 7, 0, 66)
+    Sidebar.BackgroundColor3 = Color3.fromRGB(28, 33, 45)
+    Sidebar.BorderSizePixel = 0
+    Sidebar.Parent = Card
+    Instance.new("UICorner", Sidebar).CornerRadius = UDim.new(0, 10)
+
+    local function makeTabButton(text, y)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -10, 0, 34)
+        b.Position = UDim2.new(0, 5, 0, y)
+        b.BackgroundColor3 = Color3.fromRGB(40, 48, 66)
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(230, 235, 255)
+        b.Font = Enum.Font.GothamSemibold
+        b.TextSize = 14
+        b.AutoButtonColor = true
+        b.Parent = Sidebar
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+        return b
+    end
+
+    local TabMainBtn = makeTabButton("Main", 8)
+    local TabMPSBtn  = makeTabButton("MPS",  48)
+
+    local ContentArea = Instance.new("Frame")
+    ContentArea.Size = UDim2.new(1, -122-14-7, 1, -76)
+    ContentArea.Position = UDim2.new(0, 122+14, 0, 66)
+    ContentArea.BackgroundTransparency = 1
+    ContentArea.Parent = Card
+
+    local MainPage = Instance.new("Frame"); MainPage.Size = UDim2.new(1,0,1,0); MainPage.BackgroundTransparency = 1; MainPage.Parent = ContentArea
+    local MPSPage  = Instance.new("Frame"); MPSPage.Size  = UDim2.new(1,0,1,0);  MPSPage.BackgroundTransparency  = 1; MPSPage.Visible  = false; MPSPage.Parent  = ContentArea
+
+    local function showPage(which)
+        MainPage.Visible = (which == "Main")
+        MPSPage.Visible  = (which == "MPS")
+    end
+    TabMainBtn.MouseButton1Click:Connect(function() showPage("Main") end)
+    TabMPSBtn.MouseButton1Click:Connect(function() showPage("MPS")  end)
+
+    local StatusDot = Instance.new("Frame")
+    StatusDot.Size = UDim2.fromOffset(10, 10)
+    StatusDot.Position = UDim2.new(0, 10, 0, 0)
+    StatusDot.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+    StatusDot.BorderSizePixel = 0
+    StatusDot.Parent = MainPage
+    Instance.new("UICorner", StatusDot).CornerRadius = UDim.new(1, 0)
+
+    local StatusText = Instance.new("TextLabel")
+    StatusText.Size = UDim2.new(1, -28, 0, 18)
+    StatusText.Position = UDim2.new(0, 28, 0, -2)
+    StatusText.BackgroundTransparency = 1
+    StatusText.Text = "Status: OFF"
+    StatusText.TextColor3 = Color3.fromRGB(210, 215, 230)
+    StatusText.Font = Enum.Font.Gotham
+    StatusText.TextSize = 14
+    StatusText.TextXAlignment = Enum.TextXAlignment.Left
+    StatusText.Parent = MainPage
+
+    local Toggle = Instance.new("Frame"); Toggle.Name = "Switch"
+    Toggle.Size = UDim2.fromOffset(76, 32); Toggle.Position = UDim2.new(0, 10, 0, 28)
+    Toggle.BackgroundColor3 = Color3.fromRGB(120, 125, 140)
+    Toggle.BorderSizePixel = 0; Toggle.Parent = MainPage
+    Instance.new("UICorner", Toggle).CornerRadius = UDim.new(1, 0)
+
+    local Knob = Instance.new("Frame")
+    Knob.Size = UDim2.fromOffset(28, 28); Knob.Position = UDim2.new(0, 2, 0, 2)
+    Knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255); Knob.BorderSizePixel = 0; Knob.Parent = Toggle
+    Instance.new("UICorner", Knob).CornerRadius = UDim.new(1, 0)
+
+    local ToggleLabel = Instance.new("TextLabel")
+    ToggleLabel.Size = UDim2.new(0, 220, 0, 30); ToggleLabel.Position = UDim2.new(0, 96, 0, 29)
+    ToggleLabel.BackgroundTransparency = 1
+    ToggleLabel.Text = "Enable AutoJoin"; ToggleLabel.TextColor3 = Color3.fromRGB(230, 235, 255)
+    ToggleLabel.Font = Enum.Font.GothamSemibold; ToggleLabel.TextSize = 14; ToggleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    ToggleLabel.Parent = MainPage
+
+    local toggleKey = Enum.KeyCode.F
+    local waitingForKey = false
+
+    local KeybindButton = Instance.new("TextButton")
+    KeybindButton.Size = UDim2.fromOffset(94, 32); KeybindButton.Position = UDim2.new(1, -210, 0, 28)
+    KeybindButton.BackgroundColor3 = Color3.fromRGB(40, 48, 66)
+    KeybindButton.Text = "Keybind"; KeybindButton.TextColor3 = Color3.fromRGB(230, 235, 255)
+    KeybindButton.Font = Enum.Font.GothamSemibold; KeybindButton.TextSize = 14; KeybindButton.AutoButtonColor = true; KeybindButton.Parent = MainPage
+    Instance.new("UICorner", KeybindButton).CornerRadius = UDim.new(0, 10)
+
+    local CurrentKey = Instance.new("TextLabel")
+    CurrentKey.Size = UDim2.fromOffset(80, 32); CurrentKey.Position = UDim2.new(1, -110, 0, 28)
+    CurrentKey.BackgroundTransparency = 1; CurrentKey.Text = toggleKey.Name
+    CurrentKey.TextColor3 = Color3.fromRGB(200, 210, 230); CurrentKey.Font = Enum.Font.Gotham; CurrentKey.TextSize = 14; CurrentKey.TextXAlignment = Enum.TextXAlignment.Center
+    CurrentKey.Parent = MainPage
+
+    local Log = Instance.new("ScrollingFrame")
+    Log.Size = UDim2.new(1, -20, 0, 120); Log.Position = UDim2.new(0, 10, 1, -130)
+    Log.BackgroundColor3 = Color3.fromRGB(26, 30, 40); Log.BorderSizePixel = 0; Log.ScrollBarThickness = 6
+    Log.AutomaticCanvasSize = Enum.AutomaticSize.Y; Log.Parent = MainPage
+    Instance.new("UICorner", Log).CornerRadius = UDim.new(0, 10)
+    local UIL = Instance.new("UIListLayout", Log); UIL.SortOrder = Enum.SortOrder.LayoutOrder; UIL.Padding = UDim.new(0, 4)
+
+    local function logLine(text)
+        local lbl = Instance.new("TextLabel")
+        lbl.BackgroundTransparency = 1; lbl.Size = UDim2.new(1, -8, 0, 18)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
+        lbl.TextColor3 = Color3.fromRGB(210, 220, 240); lbl.Text = text; lbl.Parent = Log
+        task.defer(function() Log.CanvasPosition = Vector2.new(0, math.huge) end)
+        local n=0; for _,c in ipairs(Log:GetChildren()) do if c:IsA("TextLabel") then n+=1 end end
+        if n>60 then for _,c in ipairs(Log:GetChildren()) do if c:IsA("TextLabel") then c:Destroy(); break end end end
+    end
+
+    -- MPS page
+    local MPSLabel = Instance.new("TextLabel")
+    MPSLabel.Size = UDim2.new(0, 220, 0, 24); MPSLabel.Position = UDim2.new(0, 10, 0, 0)
+    MPSLabel.BackgroundTransparency = 1; MPSLabel.Text = "Min $/s (skip below):"
+    MPSLabel.TextColor3 = Color3.fromRGB(230, 235, 255); MPSLabel.Font = Enum.Font.GothamSemibold; MPSLabel.TextSize = 14; MPSLabel.TextXAlignment = Enum.TextXAlignment.Left
+    MPSLabel.Parent = MPSPage
+
+    local MPSText = Instance.new("TextBox")
+    MPSText.Size = UDim2.new(0, 220, 0, 32); MPSText.Position = UDim2.new(0, 10, 0, 28)
+    MPSText.BackgroundColor3 = Color3.fromRGB(40, 48, 66); MPSText.TextColor3 = Color3.fromRGB(245, 248, 255)
+    MPSText.PlaceholderText = "15,000,000"; MPSText.Text = "15,000,000"; MPSText.Font = Enum.Font.Gotham
+    MPSText.TextSize = 14; MPSText.ClearTextOnFocus = false; MPSText.Parent = MPSPage
+    Instance.new("UICorner", MPSText).CornerRadius = UDim.new(0, 8)
+
+    local Hint = Instance.new("TextLabel")
+    Hint.Size = UDim2.new(1, -20, 0, 44); Hint.Position = UDim2.new(0, 10, 0, 68)
+    Hint.BackgroundTransparency = 1; Hint.TextWrapped = true
+    Hint.Text = "Minimum earnings rate to join. | 15m = 15,000,000 • 115m = 115,000,000 • 20k = 20,000"
+    Hint.TextColor3 = Color3.fromRGB(210, 220, 240); Hint.Font = Enum.Font.Gotham; Hint.TextSize = 13; Hint.TextXAlignment = Enum.TextXAlignment.Left
+    Hint.Parent = MPSPage
+
+    local function syncMinMPS()
+        local v = parseNumberLike(MPSText.Text)
+        if v and v >= 0 then
+            minMPS = v; MPSText.Text = formatInt(minMPS)
+            logLine("Min $/s set to " .. formatCompact(minMPS))
+        else
+            MPSText.Text = formatInt(minMPS)
+        end
+    end
+    MPSText.FocusLost:Connect(syncMinMPS)
+
+    -- helpers
+    local function setDot(on)
+        StatusDot.BackgroundColor3 = on and Color3.fromRGB(70, 210, 115) or Color3.fromRGB(180, 60, 60)
+        StatusText.Text = "Status: " .. (on and "ON" or "OFF")
+    end
+    local function setSwitch(on)
+        local trackColor = on and Color3.fromRGB(60, 190, 100) or Color3.fromRGB(120, 125, 140)
+        local targetX = on and (Toggle.AbsoluteSize.X - Knob.AbsoluteSize.X - 2) or 2
+        TweenService:Create(Toggle, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {BackgroundColor3 = trackColor}):Play()
+        TweenService:Create(Knob,   TweenInfo.new(0.15, Enum.EasingStyle.Quad), {Position = UDim2.fromOffset(targetX, 2)}):Play()
+        ToggleLabel.Text = on and "Disable AutoJoin" or "Enable AutoJoin"
+    end
+
+    task.spawn(function()
+        local lp = Players.LocalPlayer
+        while not lp do yieldOneFrame(); lp = Players.LocalPlayer end
+        UsernameLabel.Text = "User: " .. (lp.DisplayName ~= "" and lp.DisplayName or lp.Name)
+    end)
+
+    pcall(function()
+        TeleportService.TeleportInitFailed:Connect(function(_, result)
+            if result == Enum.TeleportResult.GameFull then
+                setDot(true); logLine("Server full — skipped"); teleportBusy = false
+            elseif result ~= Enum.TeleportResult.IsTeleporting then
+                teleportBusy = false
+            end
+        end)
+    end)
+
+    local function contains(str, needle)
+        if type(str) ~= "string" then return false end
+        return string.find(string.lower(str), string.lower(needle), 1, true) ~= nil
+    end
+
+    local function safePlayerGui()
+        local lp = Players.LocalPlayer
+        local tries = 0
+        while not lp and running do microPause(); lp = Players.LocalPlayer; tries += 1; if tries > 3000 then break end end
+        if not lp then return nil end
+        local pg = lp:FindFirstChildOfClass("PlayerGui")
+        if not pg then yieldFrames(2); pg = lp:FindFirstChildOfClass("PlayerGui") end
+        return pg or lp:WaitForChild("PlayerGui", 5)
+    end
+
+    local function getScreenGuiIdx4()
+        local sg = CoreGui:FindFirstChild("ScreenGui")
+        if not sg then return nil end
+        local kids = sg:GetChildren()
+        if #kids >= 4 then return kids[4] end
+        return nil
+    end
+    local function getDirectNodes()
+        local ok, sg4 = pcall(getScreenGuiIdx4)
+        if not ok or not sg4 or not sg4:IsA("ScreenGui") then return nil end
+        local Main1 = sg4:FindFirstChild("Main"); if not Main1 then return nil end
+        local Main2 = Main1:FindFirstChild("Main") or Main1
+        local Server = Main2 and Main2:FindFirstChild("Server")
+        local SF = Server and Server:FindFirstChild("ScrollingFrame"); if not SF then return nil end
+        local JobInputNode = SF:FindFirstChild("Job-ID Input")
+        local JoinJobNode  = SF:FindFirstChild("Join Job-ID")
+        if not JobInputNode or not JoinJobNode then return nil end
+        local innerMain  = JobInputNode:FindFirstChild("Main")
+        local jobTextBox = innerMain and innerMain:FindFirstChild("Input")
+        if not (jobTextBox and jobTextBox:IsA("TextBox")) then jobTextBox = JobInputNode:FindFirstChildOfClass("TextBox") end
+        local joinButton = JoinJobNode.Parent and JoinJobNode.Parent:FindFirstChildOfClass("TextButton")
+        return { server = Server, sf = SF, jobTextBox = jobTextBox, joinButton = joinButton }
+    end
+    local function getRoots()
+        local roots = { CoreGui }
+        local pg = safePlayerGui(); if pg then table.insert(roots, pg) end
+        return roots
+    end
+    local function findJoinButtonFallback()
+        for _, root in ipairs(getRoots()) do
+            for _, d in ipairs(root:GetDescendants()) do
+                if d:IsA("TextButton") and (contains(d.Text, "join job-id") or contains(d.Name, "join job-id")) then return d end
+                if d:IsA("TextLabel") and contains(d.Text, "join job-id") then
+                    local btn = d.Parent and d.Parent:FindFirstChildOfClass("TextButton"); if btn then return btn end
+                end
+            end
+        end
+        return nil
+    end
+    local function findJobIdTextBoxFallback()
+        local joinBtn = findJoinButtonFallback(); if not joinBtn then return nil end
+        local scope = joinBtn:FindFirstAncestorWhichIsA("ScrollingFrame") or joinBtn.Parent
+                    or joinBtn:FindFirstAncestorWhichIsA("Frame") or joinBtn:FindFirstAncestorWhichIsA("ScreenGui") or CoreGui
+        local best, bestScore, candidates = nil, -1, {}
+        for _, d in ipairs(scope:GetDescendants()) do
+            if d:IsA("TextBox") then
+                table.insert(candidates, d)
+                local n, t, p = d.Name or "", d.Text or "", d.PlaceholderText or ""
+                local score = 0
+                local function scoreIfHas(s,w) s = s:lower(); if s:find(w,1,true) then score += 1 end end
+                scoreIfHas(n,"job"); scoreIfHas(n,"id"); scoreIfHas(t,"job"); scoreIfHas(t,"id"); scoreIfHas(p,"job"); scoreIfHas(p,"id")
+                if score > bestScore then best, bestScore = d, score end
+            end
+        end
+        if best and bestScore>0 then return best end
+        if #candidates>0 then return candidates[1] end
+        return nil
+    end
+
+    -- ULTRA-FAST CLICK BYPASS (0ms delay)
+    local function clickJoin(button)
+        local btn = button or (getDirectNodes() and getDirectNodes().joinButton) or findJoinButtonFallback()
+        if not btn then return false end
+        
+        -- Ultra-fast click with all possible methods simultaneously
+        task.spawn(function()
+            -- Method 1: Direct event firing (fastest)
+            pcall(btn.MouseButton1Click, btn)
+            pcall(btn.MouseButton1Down, btn)
+            pcall(btn.MouseButton1Up, btn)
+            pcall(btn.Activate, btn)
+            
+            -- Method 2: Connection firing
+            if typeof(getconnections) == "function" then
+                local events = {
+                    btn.MouseButton1Click,
+                    btn.MouseButton1Down,
+                    btn.MouseButton1Up,
+                    btn.Activated
+                }
+                
+                for _, event in ipairs(events) do
+                    pcall(function()
+                        for _, conn in ipairs(getconnections(event)) do
+                            pcall(conn.Fire, conn)
+                        end
+                    end)
+                end
+            end
+            
+            -- Method 3: Virtual input (as backup)
+            if btn.AbsolutePosition and btn.AbsoluteSize then
+                local center = btn.AbsolutePosition + btn.AbsoluteSize / 2
+                pcall(function()
+                    VIM:SendMouseButtonEvent(center.X, center.Y, 0, true, btn, 0)
+                    VIM:SendMouseButtonEvent(center.X, center.Y, 0, false, btn, 0)
+                end)
+            end
+        end)
+        
+        teleportBusy = true
+        task.delay(TELEPORT_TIMEOUT_FRAMES / 60, function() teleportBusy = false end)
+        return true
+    end
+
+    -- ULTRA-FAST TEXT INPUT BYPASS (0ms typing delay)
+    local function setJobIDText(jobId)
+        -- Method 1: Direct property setting (fastest)
+        local nodes = getDirectNodes()
+        local tb = nodes and nodes.jobTextBox or findJobIdTextBoxFallback()
+        
+        if tb then
+            -- Bypass focus and typing delays
+            pcall(function()
+                -- Set text directly without focus
+                tb.Text = tostring(jobId)
+                
+                -- Force text change events
+                if typeof(getconnections) == "function" then
+                    local textChanged = tb:GetPropertyChangedSignal("Text")
+                    if textChanged then
+                        for _, conn in ipairs(getconnections(textChanged)) do
+                            pcall(conn.Fire, conn)
+                        end
+                    end
+                    
+                    -- Trigger FocusLost events without actual focus
+                    local focusLost = tb.FocusLost
+                    if focusLost then
+                        for _, conn in ipairs(getconnections(focusLost)) do
+                            pcall(conn.Fire, conn, true)
+                        end
+                    end
+                end
+            end)
+            return tb
+        end
+        
+        return nil
+    end
+
+    -- HYPER-OPTIMIZED JOB PROCESSING
+    local function processJobDecide(id, mps)
+        if not running or teleportBusy then return end
+        
+        -- Ultra-fast MPS check
+        if mps and tonumber(mps) and mps < (minMPS or 0) then
+            return  -- Instant skip without logging to save time
+        end
+        
+        -- Parallel processing - do textbox and click simultaneously
+        local textboxSuccess = setJobIDText(id)
+        
+        -- Don't wait for frames - click immediately
+        if textboxSuccess then
+            clickJoin(nil)
+            logLine("Joining Job ID")
+        else
+            logLine("Job-ID textbox not found")
+        end
+    end
+
+    local function bypass10M(item) 
+        processJobDecide(item.id, item.mps) 
+    end
+
+    local function justJoin(scriptSource)
+        if not running then return end
+        local fn, err = loadstring(scriptSource); if not fn then logLine("Load error"); return end
+        local ok = pcall(fn); if not ok then logLine("Runtime error") end
+    end
+
+    local function getWebSocketConnect()
+        if rawget(getfenv() or {}, "WebSocket") and WebSocket.connect then return WebSocket.connect end
+        if rawget(getfenv() or {}, "WebSocket") and WebSocket.Connect then return WebSocket.Connect end
+        if typeof(syn) == "table" and syn.websocket and syn.websocket.connect then return syn.websocket.connect end
+        if typeof(WebSocket) == "table" and WebSocket.connect then return WebSocket.connect end
+        return nil
+    end
+
+    -- OPTIMIZED AUTO-JOINER WITH INSTANT PROCESSING
+    local keyValid = true
+
+    local function reverifyLoop(savedUserKey)
+        task.spawn(function()
+            while running do
+                task.wait(RECHECK_SEC)
+                if not keyValid then return end
+                local okv, res = pcall(function()
+                    return JunkieKeySystem.verifyKey(API_KEY, savedUserKey, SERVICE)
+                end)
+                if not (okv and res == true) then
+                    keyValid = false
+                    clearSavedKey()
+                    running = false
+                    break
+                end
+            end
+        end)
+    end
+
+    local function startAutoJoiner(savedUserKey)
+        if running then return end
+        keyValid = true
+        setDot(true); setSwitch(true); clearQueue()
+
+        reverifyLoop(savedUserKey)
+
+        running = true
+        task.spawn(function()
+            repeat microPause() until game:IsLoaded()
+            local WebSocketURL = "ws://127.0.0.1:51948"
+            local connect = getWebSocketConnect()
+            if not connect then
+                setDot(false); setSwitch(false)
+                return
+            end
+
+            while running and keyValid do
+                local okc, socket = pcall(connect, WebSocketURL)
+                if okc and socket then
+                    logLine("Connected")
+                    
